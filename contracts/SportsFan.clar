@@ -196,3 +196,219 @@
         )
     )
 )
+
+
+
+(define-constant reward-tiers (list 
+    {tier: "bronze", threshold: u100, bonus: u5}
+    {tier: "silver", threshold: u500, bonus: u10}
+    {tier: "gold", threshold: u1000, bonus: u20}
+))
+
+(define-map user-rewards 
+    { user: principal } 
+    { total-rewards: uint, last-claim: uint })
+
+(define-public (claim-rewards)
+    (let (
+        (user-balance (ft-get-balance sportsfan tx-sender))
+        (last-claim-height (default-to u0 (get last-claim (map-get? user-rewards {user: tx-sender}))))
+        (blocks-since-claim (- stacks-block-height last-claim-height))
+        (reward-amount (if (>= user-balance u1000) u20
+            (if (>= user-balance u500) u10 u5)))
+    )
+    (begin
+        (asserts! (>= blocks-since-claim u144) err-insufficient-balance) ;; 1 day minimum
+        (try! (ft-mint? sportsfan reward-amount tx-sender))
+        (map-set user-rewards {user: tx-sender} 
+            {total-rewards: reward-amount, last-claim: stacks-block-height})
+        (ok true)
+    ))
+)
+
+
+(define-map fan-clubs
+    { club-id: uint }
+    { name: (string-ascii 50), members: uint, fee: uint })
+
+(define-map club-members
+    { club-id: uint, member: principal }
+    { joined-at: uint, active: bool })
+
+(define-public (create-fan-club (club-id uint) (name (string-ascii 50)) (fee uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set fan-clubs
+            { club-id: club-id }
+            { name: name, members: u0, fee: fee })
+        (ok true)
+    )
+)
+
+(define-public (join-fan-club (club-id uint))
+    (let ((club (unwrap! (map-get? fan-clubs {club-id: club-id}) err-invalid-item)))
+        (begin
+            (try! (ft-burn? sportsfan (get fee club) tx-sender))
+            (map-set club-members
+                { club-id: club-id, member: tx-sender }
+                { joined-at: stacks-block-height, active: true })
+            (ok true)
+        )
+    )
+)
+
+
+(define-map events
+    { event-id: uint }
+    { name: (string-ascii 50), date: uint, points: uint })
+
+(define-map event-attendance
+    { event-id: uint, attendee: principal }
+    { checked-in: bool, timestamp: uint })
+
+(define-public (create-event (event-id uint) (name (string-ascii 50)) (points uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set events
+            { event-id: event-id }
+            { name: name, date: stacks-block-height, points: points })
+        (ok true)
+    )
+)
+
+(define-public (check-in-event (event-id uint))
+    (let ((event (unwrap! (map-get? events {event-id: event-id}) err-invalid-item)))
+        (begin
+            (map-set event-attendance
+                { event-id: event-id, attendee: tx-sender }
+                { checked-in: true, timestamp: stacks-block-height })
+            (try! (award-fan-points tx-sender (get points event)))
+            (ok true)
+        )
+    )
+)
+
+(define-map merchandise-listings
+    { listing-id: uint }
+    { seller: principal, item: (string-ascii 50), price: uint, available: bool })
+
+(define-public (list-merchandise (listing-id uint) (item (string-ascii 50)) (price uint))
+    (begin
+        (map-set merchandise-listings
+            { listing-id: listing-id }
+            { seller: tx-sender, item: item, price: price, available: true })
+        (ok true)
+    )
+)
+
+(define-public (buy-listed-merchandise (listing-id uint))
+    (let ((listing (unwrap! (map-get? merchandise-listings {listing-id: listing-id}) err-invalid-item)))
+        (begin
+            (asserts! (get available listing) err-invalid-item)
+            (try! (ft-transfer? sportsfan (get price listing) tx-sender (get seller listing)))
+            (map-set merchandise-listings
+                { listing-id: listing-id }
+                (merge listing { available: false }))
+            (ok true)
+        )
+    )
+)
+
+
+(define-map achievements
+    { achievement-id: uint }
+    { name: (string-ascii 50), description: (string-ascii 100), points: uint })
+
+(define-map user-achievements
+    { user: principal, achievement-id: uint }
+    { earned: bool, earned-at: uint })
+
+(define-public (create-achievement (achievement-id uint) (name (string-ascii 50)) 
+    (description (string-ascii 100)) (points uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set achievements
+            { achievement-id: achievement-id }
+            { name: name, description: description, points: points })
+        (ok true)
+    )
+)
+
+(define-public (award-achievement (user principal) (achievement-id uint))
+    (let ((achievement (unwrap! (map-get? achievements {achievement-id: achievement-id}) err-invalid-item)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (map-set user-achievements
+                { user: user, achievement-id: achievement-id }
+                { earned: true, earned-at: stacks-block-height })
+            (try! (award-fan-points user (get points achievement)))
+            (ok true)
+        )
+    )
+)
+
+
+(define-map mascot-proposals
+    { proposal-id: uint }
+    { name: (string-ascii 50), description: (string-ascii 200), votes: uint })
+
+(define-map mascot-votes
+    { proposal-id: uint, voter: principal }
+    { voted: bool })
+
+(define-public (propose-mascot (proposal-id uint) (name (string-ascii 50)) 
+    (description (string-ascii 200)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set mascot-proposals
+            { proposal-id: proposal-id }
+            { name: name, description: description, votes: u0 })
+        (ok true)
+    )
+)
+
+(define-public (vote-for-mascot (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? mascot-proposals {proposal-id: proposal-id}) err-invalid-item)))
+        (begin
+            (asserts! (not (default-to false 
+                (get voted (map-get? mascot-votes {proposal-id: proposal-id, voter: tx-sender})))) 
+                err-owner-only)
+            (map-set mascot-votes
+                { proposal-id: proposal-id, voter: tx-sender }
+                { voted: true })
+            (map-set mascot-proposals
+                { proposal-id: proposal-id }
+                (merge proposal { votes: (+ (get votes proposal) u1) }))
+            (ok true)
+        )
+    )
+)
+
+;; Add to data maps
+(define-map referrals
+    { referrer: principal }
+    { total-referrals: uint, rewards-earned: uint })
+
+(define-map referred-users
+    { user: principal }
+    { referred-by: principal, referred-at: uint })
+
+(define-constant referral-reward u50)
+
+(define-public (refer-user (new-user principal))
+    (begin
+        (asserts! (is-none (map-get? referred-users {user: new-user})) err-invalid-item)
+        (map-set referred-users
+            { user: new-user }
+            { referred-by: tx-sender, referred-at: stacks-block-height })
+        (try! (ft-mint? sportsfan referral-reward tx-sender))
+        (map-set referrals
+            { referrer: tx-sender }
+            { total-referrals: (+ (default-to u0 
+                (get total-referrals (map-get? referrals {referrer: tx-sender}))) u1),
+              rewards-earned: (+ (default-to u0 
+                (get rewards-earned (map-get? referrals {referrer: tx-sender}))) 
+                referral-reward) })
+        (ok true)
+    )
+)
