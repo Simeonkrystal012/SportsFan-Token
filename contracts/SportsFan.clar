@@ -384,7 +384,6 @@
     )
 )
 
-;; Add to data maps
 (define-map referrals
     { referrer: principal }
     { total-referrals: uint, rewards-earned: uint })
