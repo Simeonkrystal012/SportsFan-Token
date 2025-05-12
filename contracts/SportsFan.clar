@@ -411,3 +411,93 @@
         (ok true)
     )
 )
+
+
+(define-map ticket-listings
+    { listing-id: uint }
+    { seller: principal, seat-number: uint, price: uint, active: bool })
+
+(define-public (list-season-ticket (listing-id uint) (price uint))
+    (let ((ticket (unwrap! (map-get? season-tickets {holder: tx-sender}) err-invalid-item)))
+        (begin
+            (asserts! (> (get valid-until ticket) stacks-block-height) err-invalid-item)
+            (map-set ticket-listings
+                { listing-id: listing-id }
+                { seller: tx-sender, 
+                  seat-number: (get seat-number ticket),
+                  price: price,
+                  active: true })
+            (ok true)
+        )
+    )
+)
+
+(define-public (purchase-listed-ticket (listing-id uint))
+    (let ((listing (unwrap! (map-get? ticket-listings {listing-id: listing-id}) err-invalid-item)))
+        (begin
+            (asserts! (get active listing) err-invalid-item)
+            (try! (ft-transfer? sportsfan (get price listing) tx-sender (get seller listing)))
+            (map-delete season-tickets {holder: (get seller listing)})
+            (map-set season-tickets
+                { holder: tx-sender }
+                { valid-until: (+ stacks-block-height u52560),
+                  seat-number: (get seat-number listing) })
+            (map-set ticket-listings
+                { listing-id: listing-id }
+                (merge listing { active: false }))
+            (ok true)
+        )
+    )
+)
+
+
+(define-map sponsor-tiers
+    { tier-id: uint }
+    { name: (string-ascii 20), required-stake: uint, reward-rate: uint })
+
+(define-map active-sponsors
+    { sponsor: principal }
+    { tier-id: uint, staked-amount: uint, start-height: uint })
+
+(define-public (initialize-sponsor-tiers)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set sponsor-tiers {tier-id: u1} 
+            {name: "Bronze", required-stake: u1000, reward-rate: u10})
+        (map-set sponsor-tiers {tier-id: u2}
+            {name: "Silver", required-stake: u5000, reward-rate: u20})
+        (map-set sponsor-tiers {tier-id: u3}
+            {name: "Gold", required-stake: u10000, reward-rate: u40})
+        (ok true)
+    )
+)
+
+(define-public (become-sponsor (tier-id uint))
+    (let ((tier (unwrap! (map-get? sponsor-tiers {tier-id: tier-id}) err-invalid-item)))
+        (begin
+            (try! (ft-transfer? sportsfan (get required-stake tier) tx-sender contract-owner))
+            (map-set active-sponsors
+                { sponsor: tx-sender }
+                { tier-id: tier-id,
+                  staked-amount: (get required-stake tier),
+                  start-height: stacks-block-height })
+            (ok true)
+        )
+    )
+)
+
+
+(define-public (withdraw-sponsorship)
+    (let ((sponsor (unwrap! (map-get? active-sponsors {sponsor: tx-sender}) err-invalid-item)))
+        (begin
+            (try! (ft-transfer? sportsfan (get staked-amount sponsor) contract-owner tx-sender))
+            (map-delete active-sponsors {sponsor: tx-sender})
+            (ok true)
+        )
+    )
+)
+(define-public (get-sponsor-tier (sponsor principal))
+    (let ((sponsor-data (unwrap! (map-get? active-sponsors {sponsor: sponsor}) err-invalid-item)))
+        (ok (get tier-id sponsor-data))
+    )
+)
