@@ -501,3 +501,93 @@
         (ok (get tier-id sponsor-data))
     )
 )
+
+
+(define-map stake-pools
+    { pool-id: uint }
+    { duration-blocks: uint, reward-multiplier: uint, active: bool })
+
+(define-map user-stakes
+    { staker: principal, stake-id: uint }
+    { amount: uint, pool-id: uint, start-height: uint, claimed: bool })
+
+(define-map staker-counters
+    { staker: principal }
+    { next-stake-id: uint })
+
+(define-constant err-invalid-pool (err u103))
+(define-constant err-stake-not-found (err u104))
+(define-constant err-stake-locked (err u105))
+(define-constant err-already-claimed (err u106))
+
+(define-public (create-stake-pool (pool-id uint) (duration-blocks uint) (reward-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set stake-pools
+            { pool-id: pool-id }
+            { duration-blocks: duration-blocks, reward-multiplier: reward-multiplier, active: true })
+        (ok true)
+    )
+)
+
+(define-public (stake-tokens (pool-id uint) (amount uint))
+    (let (
+        (pool (unwrap! (map-get? stake-pools {pool-id: pool-id}) err-invalid-pool))
+        (current-stake-id (default-to u0 (get next-stake-id (map-get? staker-counters {staker: tx-sender}))))
+    )
+    (begin
+        (asserts! (get active pool) err-invalid-pool)
+        (try! (ft-transfer? sportsfan amount tx-sender contract-owner))
+        (map-set user-stakes
+            { staker: tx-sender, stake-id: current-stake-id }
+            { amount: amount, pool-id: pool-id, start-height: stacks-block-height, claimed: false })
+        (map-set staker-counters
+            { staker: tx-sender }
+            { next-stake-id: (+ current-stake-id u1) })
+        (ok current-stake-id)
+    ))
+)
+
+(define-public (unstake-tokens (stake-id uint))
+    (let (
+        (stake (unwrap! (map-get? user-stakes {staker: tx-sender, stake-id: stake-id}) err-stake-not-found))
+        (pool (unwrap! (map-get? stake-pools {pool-id: (get pool-id stake)}) err-invalid-pool))
+        (unlock-height (+ (get start-height stake) (get duration-blocks pool)))
+        (reward-amount (/ (* (get amount stake) (get reward-multiplier pool)) u100))
+    )
+    (begin
+        (asserts! (>= stacks-block-height unlock-height) err-stake-locked)
+        (asserts! (not (get claimed stake)) err-already-claimed)
+        (try! (ft-transfer? sportsfan (get amount stake) contract-owner tx-sender))
+        (try! (ft-mint? sportsfan reward-amount tx-sender))
+        (map-set user-stakes
+            { staker: tx-sender, stake-id: stake-id }
+            (merge stake { claimed: true }))
+        (ok (+ (get amount stake) reward-amount))
+    ))
+)
+
+(define-read-only (get-stake-info (staker principal) (stake-id uint))
+    (map-get? user-stakes {staker: staker, stake-id: stake-id})
+)
+
+(define-read-only (get-pool-info (pool-id uint))
+    (map-get? stake-pools {pool-id: pool-id})
+)
+
+(define-read-only (calculate-stake-rewards (staker principal) (stake-id uint))
+    (let (
+        (stake (unwrap! (map-get? user-stakes {staker: staker, stake-id: stake-id}) (err u0)))
+        (pool (unwrap! (map-get? stake-pools {pool-id: (get pool-id stake)}) (err u0)))
+    )
+    (ok (/ (* (get amount stake) (get reward-multiplier pool)) u100)))
+)
+
+(define-read-only (is-stake-unlocked (staker principal) (stake-id uint))
+    (let (
+        (stake (unwrap! (map-get? user-stakes {staker: staker, stake-id: stake-id}) (err u0)))
+        (pool (unwrap! (map-get? stake-pools {pool-id: (get pool-id stake)}) (err u0)))
+        (unlock-height (+ (get start-height stake) (get duration-blocks pool)))
+    )
+    (ok (>= stacks-block-height unlock-height)))
+)
