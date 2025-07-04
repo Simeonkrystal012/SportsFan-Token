@@ -591,3 +591,180 @@
     )
     (ok (>= stacks-block-height unlock-height)))
 )
+
+(define-constant err-auction-not-found (err u107))
+(define-constant err-auction-ended (err u108))
+(define-constant err-auction-active (err u109))
+(define-constant err-not-auction-owner (err u110))
+(define-constant err-bid-too-low (err u111))
+(define-constant err-self-bid (err u112))
+(define-constant err-no-bids (err u113))
+
+(define-map auctions
+    { auction-id: uint }
+    { owner: principal, 
+      item: (string-ascii 100),
+      description: (string-ascii 200),
+      starting-price: uint,
+      current-bid: uint,
+      highest-bidder: (optional principal),
+      end-height: uint,
+      active: bool,
+      reserve-met: bool })
+
+(define-map auction-bids
+    { auction-id: uint, bidder: principal }
+    { amount: uint, timestamp: uint })
+
+(define-map auction-counters
+    { counter-key: (string-ascii 10) }
+    { value: uint })
+
+(define-public (initialize-auction-system)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set auction-counters {counter-key: "next-id"} {value: u1})
+        (ok true)
+    )
+)
+
+(define-public (create-auction (item (string-ascii 100)) (description (string-ascii 200)) 
+    (starting-price uint) (reserve-price uint) (duration-blocks uint))
+    (let (
+        (auction-id (default-to u1 (get value (map-get? auction-counters {counter-key: "next-id"}))))
+        (end-height (+ stacks-block-height duration-blocks))
+    )
+    (begin
+        (asserts! (>= (ft-get-balance sportsfan tx-sender) u100) err-insufficient-balance)
+        (try! (ft-burn? sportsfan u100 tx-sender))
+        (map-set auctions
+            { auction-id: auction-id }
+            { owner: tx-sender,
+              item: item,
+              description: description,
+              starting-price: starting-price,
+              current-bid: starting-price,
+              highest-bidder: none,
+              end-height: end-height,
+              active: true,
+              reserve-met: (>= starting-price reserve-price) })
+        (map-set auction-counters 
+            {counter-key: "next-id"} 
+            {value: (+ auction-id u1)})
+        (ok auction-id)
+    ))
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+    (let (
+        (auction (unwrap! (map-get? auctions {auction-id: auction-id}) err-auction-not-found))
+        (current-bidder (get highest-bidder auction))
+        (current-bid (get current-bid auction))
+        (refund-amount (if (is-some current-bidder) current-bid u0))
+    )
+    (begin
+        (asserts! (get active auction) err-auction-ended)
+        (asserts! (< stacks-block-height (get end-height auction)) err-auction-ended)
+        (asserts! (not (is-eq tx-sender (get owner auction))) err-self-bid)
+        (asserts! (> bid-amount current-bid) err-bid-too-low)
+        (try! (ft-transfer? sportsfan bid-amount tx-sender contract-owner))
+        (if (is-some current-bidder)
+            (try! (ft-transfer? sportsfan refund-amount contract-owner (unwrap-panic current-bidder)))
+            true)
+        (map-set auction-bids
+            { auction-id: auction-id, bidder: tx-sender }
+            { amount: bid-amount, timestamp: stacks-block-height })
+        (map-set auctions
+            { auction-id: auction-id }
+            (merge auction { current-bid: bid-amount, highest-bidder: (some tx-sender) }))
+        (ok true)
+    ))
+)
+
+(define-public (end-auction (auction-id uint))
+    (let (
+        (auction (unwrap! (map-get? auctions {auction-id: auction-id}) err-auction-not-found))
+        (winner (get highest-bidder auction))
+        (winning-bid (get current-bid auction))
+        (owner (get owner auction))
+    )
+    (begin
+        (asserts! (get active auction) err-auction-ended)
+        (asserts! (>= stacks-block-height (get end-height auction)) err-auction-active)
+        (if (is-some winner)
+            (try! (ft-transfer? sportsfan winning-bid contract-owner owner))
+            true)
+        (map-set auctions
+            { auction-id: auction-id }
+            (merge auction { active: false }))
+        (ok (is-some winner))
+    ))
+)
+
+(define-public (cancel-auction (auction-id uint))
+    (let (
+        (auction (unwrap! (map-get? auctions {auction-id: auction-id}) err-auction-not-found))
+        (current-bidder (get highest-bidder auction))
+        (current-bid (get current-bid auction))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get owner auction)) err-not-auction-owner)
+        (asserts! (get active auction) err-auction-ended)
+        (asserts! (< stacks-block-height (get end-height auction)) err-auction-ended)
+        (if (is-some current-bidder)
+            (try! (ft-transfer? sportsfan current-bid contract-owner (unwrap-panic current-bidder)))
+            true)
+        (map-set auctions
+            { auction-id: auction-id }
+            (merge auction { active: false }))
+        (ok true)
+    ))
+)
+
+(define-public (extend-auction (auction-id uint) (additional-blocks uint))
+    (let (
+        (auction (unwrap! (map-get? auctions {auction-id: auction-id}) err-auction-not-found))
+        (new-end-height (+ (get end-height auction) additional-blocks))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get owner auction)) err-not-auction-owner)
+        (asserts! (get active auction) err-auction-ended)
+        (asserts! (< stacks-block-height (get end-height auction)) err-auction-ended)
+        (try! (ft-burn? sportsfan u50 tx-sender))
+        (map-set auctions
+            { auction-id: auction-id }
+            (merge auction { end-height: new-end-height }))
+        (ok true)
+    ))
+)
+
+(define-read-only (get-auction-info (auction-id uint))
+    (map-get? auctions {auction-id: auction-id})
+)
+
+(define-read-only (get-user-bid (auction-id uint) (bidder principal))
+    (map-get? auction-bids {auction-id: auction-id, bidder: bidder})
+)
+
+(define-read-only (get-auction-time-left (auction-id uint))
+    (let (
+        (auction (unwrap! (map-get? auctions {auction-id: auction-id}) (err u0)))
+        (end-height (get end-height auction))
+    )
+    (ok (if (> end-height stacks-block-height) (- end-height stacks-block-height) u0)))
+)
+
+(define-read-only (is-auction-winner (auction-id uint) (user principal))
+    (let (
+        (auction (unwrap! (map-get? auctions {auction-id: auction-id}) (err u0)))
+        (winner (get highest-bidder auction))
+    )
+    (ok (is-eq (some user) winner)))
+)
+
+(define-read-only (get-active-auctions-count)
+    (let (
+        (total-auctions (default-to u1 (get value (map-get? auction-counters {counter-key: "next-id"}))))
+    )
+    (ok (- total-auctions u1)))
+)
