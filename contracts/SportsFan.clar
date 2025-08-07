@@ -768,3 +768,287 @@
     )
     (ok (- total-auctions u1)))
 )
+
+;; Fan Challenge System - Community-driven engagement challenges
+(define-constant err-challenge-not-found (err u114))
+(define-constant err-challenge-expired (err u115))
+(define-constant err-already-participating (err u116))
+(define-constant err-not-participating (err u117))
+(define-constant err-invalid-progress (err u118))
+(define-constant err-challenge-not-completed (err u119))
+(define-constant err-reward-already-claimed (err u120))
+
+;; Challenge definitions and metadata
+(define-map challenges
+    { challenge-id: uint }
+    { creator: principal,
+      title: (string-ascii 80),
+      description: (string-ascii 200),
+      challenge-type: uint, ;; 1=attendance, 2=prediction, 3=social, 4=spending, 5=custom
+      target-value: uint,
+      reward-amount: uint,
+      duration-blocks: uint,
+      created-at: uint,
+      active: bool,
+      participants-count: uint })
+
+;; Individual participant progress tracking
+(define-map challenge-participants
+    { challenge-id: uint, participant: principal }
+    { joined-at: uint,
+      current-progress: uint,
+      completed: bool,
+      reward-claimed: bool,
+      last-updated: uint })
+
+;; Challenge activity log for verification
+(define-map challenge-activities
+    { challenge-id: uint, participant: principal, activity-id: uint }
+    { activity-type: uint,
+      value: uint,
+      timestamp: uint,
+      verified: bool })
+
+;; Global challenge counter
+(define-map challenge-counters
+    { key: (string-ascii 15) }
+    { value: uint })
+
+;; Challenge categories and their validation requirements
+(define-map challenge-types
+    { type-id: uint }
+    { name: (string-ascii 30),
+      min-target: uint,
+      max-target: uint,
+      base-cost: uint })
+
+;; Initialize the challenge system with predefined types
+(define-public (initialize-challenge-system)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Set up challenge types
+        (map-set challenge-types {type-id: u1} 
+            {name: "Event Attendance", min-target: u1, max-target: u50, base-cost: u200})
+        (map-set challenge-types {type-id: u2}
+            {name: "Prediction Accuracy", min-target: u1, max-target: u20, base-cost: u150})
+        (map-set challenge-types {type-id: u3}
+            {name: "Social Engagement", min-target: u5, max-target: u100, base-cost: u100})
+        (map-set challenge-types {type-id: u4}
+            {name: "Token Spending", min-target: u50, max-target: u5000, base-cost: u300})
+        (map-set challenge-types {type-id: u5}
+            {name: "Custom Activity", min-target: u1, max-target: u1000, base-cost: u250})
+        ;; Initialize counters
+        (map-set challenge-counters {key: "next-challenge"} {value: u1})
+        (map-set challenge-counters {key: "total-active"} {value: u0})
+        (ok true)
+    )
+)
+
+;; Create a new community challenge
+(define-public (create-challenge (title (string-ascii 80)) (description (string-ascii 200))
+    (challenge-type uint) (target-value uint) (reward-amount uint) (duration-blocks uint))
+    (let (
+        (challenge-id (default-to u1 (get value (map-get? challenge-counters {key: "next-challenge"}))))
+        (type-info (unwrap! (map-get? challenge-types {type-id: challenge-type}) err-invalid-item))
+        (creation-cost (get base-cost type-info))
+    )
+    (begin
+        ;; Validate challenge parameters
+        (asserts! (>= target-value (get min-target type-info)) err-invalid-progress)
+        (asserts! (<= target-value (get max-target type-info)) err-invalid-progress)
+        (asserts! (>= duration-blocks u144) err-invalid-progress) ;; Minimum 1 day
+        (asserts! (<= duration-blocks u525600) err-invalid-progress) ;; Maximum 1 year
+        
+        ;; Charge creation fee and lock reward tokens
+        (try! (ft-burn? sportsfan creation-cost tx-sender))
+        (try! (ft-transfer? sportsfan reward-amount tx-sender contract-owner))
+        
+        ;; Create the challenge
+        (map-set challenges
+            { challenge-id: challenge-id }
+            { creator: tx-sender,
+              title: title,
+              description: description,
+              challenge-type: challenge-type,
+              target-value: target-value,
+              reward-amount: reward-amount,
+              duration-blocks: duration-blocks,
+              created-at: stacks-block-height,
+              active: true,
+              participants-count: u0 })
+        
+        ;; Update counters
+        (map-set challenge-counters {key: "next-challenge"} {value: (+ challenge-id u1)})
+        (map-set challenge-counters {key: "total-active"} 
+            {value: (+ (default-to u0 (get value (map-get? challenge-counters {key: "total-active"}))) u1)})
+        
+        (ok challenge-id)
+    ))
+)
+
+;; Join an active challenge
+(define-public (join-challenge (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges {challenge-id: challenge-id}) err-challenge-not-found))
+        (expiry-height (+ (get created-at challenge) (get duration-blocks challenge)))
+    )
+    (begin
+        ;; Validate challenge is active and not expired
+        (asserts! (get active challenge) err-challenge-expired)
+        (asserts! (< stacks-block-height expiry-height) err-challenge-expired)
+        (asserts! (is-none (map-get? challenge-participants {challenge-id: challenge-id, participant: tx-sender})) 
+            err-already-participating)
+        
+        ;; Require minimum token balance to participate
+        (asserts! (>= (ft-get-balance sportsfan tx-sender) u10) err-insufficient-balance)
+        
+        ;; Add participant
+        (map-set challenge-participants
+            { challenge-id: challenge-id, participant: tx-sender }
+            { joined-at: stacks-block-height,
+              current-progress: u0,
+              completed: false,
+              reward-claimed: false,
+              last-updated: stacks-block-height })
+        
+        ;; Update participant count
+        (map-set challenges
+            { challenge-id: challenge-id }
+            (merge challenge { participants-count: (+ (get participants-count challenge) u1) }))
+        
+        (ok true)
+    ))
+)
+
+;; Update progress on a challenge (can be called by participant or contract functions)
+(define-public (update-challenge-progress (challenge-id uint) (participant principal) (progress-increment uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges {challenge-id: challenge-id}) err-challenge-not-found))
+        (participant-data (unwrap! (map-get? challenge-participants {challenge-id: challenge-id, participant: participant}) 
+            err-not-participating))
+        (new-progress (+ (get current-progress participant-data) progress-increment))
+        (is-completed (>= new-progress (get target-value challenge)))
+        (expiry-height (+ (get created-at challenge) (get duration-blocks challenge)))
+    )
+    (begin
+        ;; Validate challenge is still active
+        (asserts! (get active challenge) err-challenge-expired)
+        (asserts! (< stacks-block-height expiry-height) err-challenge-expired)
+        (asserts! (not (get completed participant-data)) err-reward-already-claimed)
+        
+        ;; Allow self-updates or contract owner updates
+        (asserts! (or (is-eq tx-sender participant) (is-eq tx-sender contract-owner)) err-not-participating)
+        
+        ;; Update participant progress
+        (map-set challenge-participants
+            { challenge-id: challenge-id, participant: participant }
+            (merge participant-data { 
+                current-progress: new-progress,
+                completed: is-completed,
+                last-updated: stacks-block-height }))
+        
+        ;; Log the activity for verification
+        (map-set challenge-activities
+            { challenge-id: challenge-id, participant: participant, activity-id: stacks-block-height }
+            { activity-type: (get challenge-type challenge),
+              value: progress-increment,
+              timestamp: stacks-block-height,
+              verified: (is-eq tx-sender contract-owner) })
+        
+        (ok is-completed)
+    ))
+)
+
+;; Claim reward for completed challenge
+(define-public (claim-challenge-reward (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges {challenge-id: challenge-id}) err-challenge-not-found))
+        (participant-data (unwrap! (map-get? challenge-participants {challenge-id: challenge-id, participant: tx-sender}) 
+            err-not-participating))
+        (reward-per-participant (/ (get reward-amount challenge) 
+            (if (> (get participants-count challenge) u0) (get participants-count challenge) u1)))
+    )
+    (begin
+        ;; Validate completion and reward status
+        (asserts! (get completed participant-data) err-challenge-not-completed)
+        (asserts! (not (get reward-claimed participant-data)) err-reward-already-claimed)
+        
+        ;; Transfer reward from contract to participant
+        (try! (ft-transfer? sportsfan reward-per-participant contract-owner tx-sender))
+        
+        ;; Mark reward as claimed
+        (map-set challenge-participants
+            { challenge-id: challenge-id, participant: tx-sender }
+            (merge participant-data { reward-claimed: true }))
+        
+        (ok reward-per-participant)
+    ))
+)
+
+;; End a challenge early (creator only)
+(define-public (end-challenge (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges {challenge-id: challenge-id}) err-challenge-not-found))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get creator challenge)) err-not-auction-owner)
+        (asserts! (get active challenge) err-challenge-expired)
+        
+        ;; Mark challenge as inactive
+        (map-set challenges
+            { challenge-id: challenge-id }
+            (merge challenge { active: false }))
+        
+        ;; Update active counter
+        (map-set challenge-counters {key: "total-active"} 
+            {value: (- (default-to u0 (get value (map-get? challenge-counters {key: "total-active"}))) u1)})
+        
+        (ok true)
+    ))
+)
+
+;; Read-only functions for challenge system
+(define-read-only (get-challenge-info (challenge-id uint))
+    (map-get? challenges {challenge-id: challenge-id})
+)
+
+(define-read-only (get-participant-progress (challenge-id uint) (participant principal))
+    (map-get? challenge-participants {challenge-id: challenge-id, participant: participant})
+)
+
+(define-read-only (get-challenge-leaderboard (challenge-id uint) (participant principal))
+    (let (
+        (participant-data (map-get? challenge-participants {challenge-id: challenge-id, participant: participant}))
+    )
+    (match participant-data
+        some-data (ok (get current-progress some-data))
+        (ok u0)))
+)
+
+(define-read-only (is-challenge-active (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges {challenge-id: challenge-id}) (err u0)))
+        (expiry-height (+ (get created-at challenge) (get duration-blocks challenge)))
+    )
+    (ok (and (get active challenge) (< stacks-block-height expiry-height))))
+)
+
+(define-read-only (get-challenge-time-remaining (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges {challenge-id: challenge-id}) (err u0)))
+        (expiry-height (+ (get created-at challenge) (get duration-blocks challenge)))
+    )
+    (ok (if (> expiry-height stacks-block-height) (- expiry-height stacks-block-height) u0)))
+)
+
+(define-read-only (get-total-challenges)
+    (let (
+        (total (default-to u1 (get value (map-get? challenge-counters {key: "next-challenge"}))))
+    )
+    (ok (- total u1)))
+)
+
+(define-read-only (get-active-challenges-count)
+    (ok (default-to u0 (get value (map-get? challenge-counters {key: "total-active"}))))
+)
+
